@@ -777,8 +777,7 @@
           const resp = await fetch(url, {signal: controller.signal});
           clearTimeout(tid);
           const data = await resp.json();
-          const parsed = parseApiData(data);
-          if(parsed) return parsed;
+          if(data && data.fajr_begins) return data;
         } catch(e){
           if(attempt<3) await new Promise(r=>setTimeout(r, attempt*1000));
         }
@@ -786,12 +785,34 @@
       return null;
     }
 
+    /* ── Admin-set times (uploaded timetable / one-day overrides) ──
+       get_prayer_days returns only the fields the admin set, keyed by date,
+       using Techtronix field names. Any failure → {} (API times used as-is). */
+    function localDateStr(d){
+      return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+    }
+    async function fetchAdminDays(from, to){
+      try {
+        const timeout = new Promise(r=>setTimeout(()=>r({error:'timeout'}), 8000));
+        const res = await Promise.race([sb.rpc('get_prayer_days', {p_from: localDateStr(from), p_to: localDateStr(to)}), timeout]);
+        if(res.error || !res.data || typeof res.data !== 'object') return {};
+        return res.data;
+      } catch(e){ console.warn('Admin prayer times fetch failed:', e); return {}; }
+    }
+
     async function fetchFromWebsite(){
       try {
-        const [todayData, tmrData] = await Promise.all([
+        const now = new Date();
+        const tmrDate = new Date(now.getFullYear(), now.getMonth(), now.getDate()+1);
+        const [rawToday, rawTmr, adminDays] = await Promise.all([
           fetchApi(SALAAH_API_URL),
-          fetchApi(TOMORROW_API_URL)
+          fetchApi(TOMORROW_API_URL),
+          fetchAdminDays(now, tmrDate)
         ]);
+        const adminToday = adminDays[localDateStr(now)];
+        const adminTmr = adminDays[localDateStr(tmrDate)];
+        const todayData = parseApiData(adminToday ? Object.assign({}, rawToday || {}, adminToday) : rawToday);
+        const tmrData = parseApiData(adminTmr ? Object.assign({}, rawTmr || {}, adminTmr) : rawTmr);
 
         if(todayData){
           apiToday = todayData;
@@ -1048,6 +1069,19 @@
     fetchRemoteConfig().then(() => fetchFromWebsite());
     fetchAdminIslamicDate();
     setInterval(fetchFromWebsite, 3*60*60*1000);
+
+    // Refetch when the date changes so one-day overrides revert straight after midnight
+    let lastFetchDate = localDateStr(new Date());
+    setInterval(() => {
+      const d = localDateStr(new Date());
+      if(d !== lastFetchDate){ lastFetchDate = d; fetchFromWebsite(); }
+    }, 60*1000);
+
+    // Refetch immediately when the admin changes the timetable or a one-day time
+    sb.channel('display-prayer-overrides')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'prayer_timetable' }, () => fetchFromWebsite())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'prayer_time_overrides' }, () => fetchFromWebsite())
+      .subscribe();
 
     /* ── SETTINGS PANEL LOGIC ── */
     const overlay = document.getElementById('settingsOverlay');
